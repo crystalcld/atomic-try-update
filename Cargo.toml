@@ -1,0 +1,12 @@
+[package]
+name = "atomic-try-update"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+crossbeam-utils = "0.8"
+
+[dev-dependencies]
+tokio = { version = "1", features = [ "macros", "rt-multi-thread", "test-util" ] }
