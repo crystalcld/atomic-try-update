@@ -1,4 +1,15 @@
-use std::marker::PhantomData;
+//! Primitives that make it easy to implement correct lock-free algorithms
+//!
+//! `atomic_try_update` is the main entry-point to this library, but the
+//! included example code is also designed to be used in production.  Each
+//! module implements a different family of example algorithms.  If you
+//! simply want to use general-purpose algorithms without modification,
+//! start with the public APIs of the data structures in those modules.
+//!
+//! If you want to start implementing your own specialized lock-free logic,
+//! start with this page, then read the top-level descriptions of each
+//! of the modules this crate exports.
+use std::{marker::PhantomData, ptr::null_mut};
 
 // AtomicCell uses a lock-based fallback for u128 because stable rust does
 // not include AtomicU128.
@@ -10,33 +21,31 @@ use std::marker::PhantomData;
 // https://docs.rs/portable-atomic/latest/portable_atomic/struct.AtomicU128.html
 use crossbeam_utils::atomic::AtomicCell;
 
+pub mod bits;
+pub mod claim;
 pub mod stack;
 
+/// A wrapper that allows an instance of type T to be treated as though it is
+/// an atomic integer type (in the style of a C/C++ union).  Use
+/// `atomic_try_update` to access the data of type `T` stored in an `Atom<T>`.
+///
+/// The generic parameter `U` is the smallest unsigned integer type that is large
+/// enough to hold an instance of T.  (Typically: `u64` or `u128`)
 pub struct Atom<T, U> {
     union: PhantomData<T>,
     inner: AtomicCell<U>,
 }
 
-impl<T, U> Atom<T, U>
-where
-    U: Default + Send,
-{
-    pub fn new() -> Atom<T, U> {
-        assert!(std::mem::size_of::<T>() <= std::mem::size_of::<U>());
-        assert!(
-            std::mem::size_of::<U>() <= 2
-                || std::mem::size_of::<T>() > std::mem::size_of::<U>() / 2
-        );
-        Atom::<T, U> {
-            union: PhantomData::<T> {},
-            inner: Default::default(),
-        }
-    }
-}
 impl<T, U> Default for Atom<T, U>
 where
     U: Default + Send,
 {
+    /// This creates a new instance of Atom, initializing the contents to
+    /// all-zero bytes.
+    ///
+    /// TODO: Change this so that T implements Default, and then store the
+    /// default instance of T in the atom?  If we do that, what happens to
+    /// the uninitialized padding bytes?
     fn default() -> Self {
         assert!(std::mem::size_of::<T>() <= std::mem::size_of::<U>());
         assert!(
@@ -52,7 +61,7 @@ where
 
 // TODO: Restrict these so that ptr T is OK, but most other things are not.
 // Also, it would be nice if the type of T was richer so that we could avoid
-// these unsafe impls.
+// these.
 unsafe impl<T, U> Sync for Atom<T, U> {}
 unsafe impl<T, U> Send for Atom<T, U> {}
 
@@ -78,7 +87,7 @@ unsafe impl<T, U> Send for Atom<T, U> {}
 ///
 /// First, 128 bits is quite a lot of state and modern machines support 128-bit CAS.
 /// Pointers on 64-bit machines are ~ 40-48 bits wide, so it is enough space for
-/// two or three pointers, with some bits left over to encode additional state.
+/// two or three pointers with some bits left over to encode additional state.
 /// If even more bits are needed, you can play tricks such as storing offsets into
 /// an array instead of memory addresses.  This allows you to pack state machines
 /// and simple data structure (including stacks, registers, and even simple
@@ -96,74 +105,82 @@ unsafe impl<T, U> Send for Atom<T, U> {}
 /// violations, and other unsound behavior.  Therefore, we annotate the function
 /// "unsafe".
 ///
-/// In particular, if T is a Box<...>, and the lambda overwites its argument,
+/// In particular, if T is a Box<...>, and the lambda overwrites its argument,
 /// then the old value in the Box could be double-freed.
 ///
 /// # Safety
 ///
-/// In order to use atomic_try_update safely, make sure your code follows
-/// the following three rules:
+/// In order to use atomic_try_update safely, make sure your lambda follows
+/// the following two rules:
 ///
-/// 1. The lambda must not have any side effects.  In particular, it must not
-/// crash if it is provided with stale input.
+/// 1. It must implement *read set equivalence*.
+/// 2. It must be a pure (side-effect-free) function.
 ///
-/// 2. The results of speculative reads must not escape.  This is related to
-/// the first invariant.  Since the lambda can run multiple times, you need
-/// to make sure that any state it updates is updated on each iteartion of
-/// the loop.  A classic mistake (from similar libraries in languages that
-/// lack a borrow checker) is to capture a reference to a stack variable,
-/// and then have the lambda modify it on one branch of a conditional, but
-/// not the other.  Rust's borrow checker will notice most attempts to do
-/// this, buy you can circumvent it by (for instance) taking a reference
-/// to a mutex or an atomic value.  There's no valid reason to do such things,
-/// so dont.
+/// ## Rule 1: Read set equivalence
 ///
-/// 3. Read set equivalence.  This is the most subtle, and most-often violated
-/// of the three rules:  If the compare_and_exchange performed
-/// by atomic_try_update succeeds, then all values observed by the lambda must
-/// be up to date.
+/// Read set equivalence is the invariant that if the current value of the
+/// `Atom` matches the pre-value read by `atomic_try_update`, then all data
+/// read by the lambda has the same value as it had when the lambda read it.
 ///
-/// Early databases achieved this via locking values to prevent concurrent writes.
-/// More recent systems use optimistic concurrency control to check to see if any
-/// concurrent writes might have invalidated the reads a transaction performed.
+/// This concept is closely related to, but distinct from approaches used
+/// in database concurrency control algorithms.
 ///
-/// Our rule allows more schedules than either of those approaches:
+/// Read set equivalence trivially holds if the lambda only reads the data
+/// that was passed directly into it, and doesn't follow pointers, references,
+/// or otherwise observe other non-local state in the system.
 ///
-/// Concurrent writes to the transaction's read set are allowed as long as the most
-/// recent of those writes installed the same bits as the ones our transaction
-/// observed.
+/// It is also fine for the lambda to read data from its caller's stack
+/// frame, as long as that data is immutable while atomic_try_update is
+/// running.  This is most easily achieved by only capturing shared references,
+/// and not capturing references to things that make use of interior mutability
+/// (such as Mutex, or any of the atomic integer types).
 ///
-/// Since atomic_try_update only checks bits that live within the integer that compare
-/// and swap examines, the lambda must ensure that any other values it read were
-/// either not modified in race, or that such modifications installed identical state.
+/// Another common approach involves using some extra mechanism to ensure read
+/// set equivalence.  For instance, some data structures include a nonce in the
+/// data stored by `Atom`, and increment it on each operation.  As long as the
+/// nonce does not wrap back around to exactly the same value just in time for
+/// the compare and swap to run, then we know that no other operations on this
+/// `Atom` have modified any state that we read in race with us.
 ///
-/// Read set equivalence is easily checked in many cases.  For example, it is trivially
-/// true if the lambda only accesses data that was passed directly into it, and doesn't
-/// read any other memory addresses.
+/// The examples in the stack module explain read set equivalence in more detail.
 ///
-/// However, some algorithms, such as stack implementations, need to derference
-/// pointers, or read other data on the heap.  Such algorithms may be vulnerable
-/// to the "ABA problem."  One solution is to use a nonce to get probablistic
-/// correctness.  Another is to modify your operation's semantcs so that it
-/// can be implemented without violating read set equivalence.
+/// ### Comparison with database concurrency control algorithms
 ///
-/// The examples include a few stack implementations that explain read set
-/// equivalance in more detail.
+/// Read set equivalence allows more schedules than typical database concurrency
+/// control algorithms.  In particular, it allows write-write and read-write
+/// conflicts in the case where the read set of the lambda ("transactions", in
+/// their context) has been changed, but then changed back to the value the
+/// transaction observed.  Two phase locking prevents such schedules by blocking
+/// execution of conflicting logic, and multi-version concurrency control prevents
+/// them by only examining the version number of the read set, and not its
+/// contents.  (The nonce trick we mentioned above is analogous to multi-version
+/// concurrency control.)
 ///
-/// Naive stack algorithms suffer from the following ABA issue:  It is possible
-/// for pop() to read the head pointer "A", then be descheduled.  In race, the
-/// head pointer and some other values are popped, then a node with the same
-/// memory address as A is pushed back onto the stack.  The CAS will succeed,
-/// even though the current value of head is semantically distinct from the
-/// value the lambda read.
+/// ## Rule 2: Pure functions
 ///
-/// `Stack` avoids this by providing a `pop_all` method that removes everything
-/// from the stack atomically.  This guarantees read set equivalence because it
-/// does not read anything other than the CAS bits.
+/// There are a few common ways for lambdas to fail to be pure functions,
+/// ordered from most to least likely:
 ///
-/// `NonceStack` uses a nonce to ensure that no pushes have been performed
-/// in race with pop, which probabilistically guarantees that head was not popped
-/// then pushed back on to the stack in race with a pop.
+/// The value that is stored in the the `Atom` could implicitly interact
+/// with global state.  For instance, it could be a `Box` and talk to the
+/// allocator, or it could attempt to perform I/O.
+///
+/// The lambda could read a value, store it on the heap or in a captured
+/// stack variable, and then return true.  If the compare and swap fails,
+/// the lambda runs again, and then fails to overwrite the state from
+/// the failed speculative read, then it violates linearizability.
+///
+/// Thanks to the borrow checker, it is fairly difficult to implement
+/// such a bug.  In particular, if your lambda attempts to capture a
+/// shared reference (`&mut`), it will fail to compile.  However, you
+/// could defeat this check via internal mutability.
+///
+/// Finally, your lambda could crash or exhibit undefined behavior.  Other
+/// versions of atomic_try_update include an "unsafe" (not in the rust
+/// sense) variant that allows torn reads.  This means that the bit
+/// representation of the object that is passed into your lambda could
+/// be invalid, violating Rust's safety guarantees, or causing sanity
+/// checks to fail, leading to panics.
 pub unsafe fn atomic_try_update<T, U, F, R>(state: &Atom<T, U>, func: F) -> R
 where
     F: Fn(&mut T) -> (bool, R),
@@ -188,5 +205,72 @@ where
                 newval = old;
             }
         }
+    }
+}
+
+/// A linked list node that contains an instance of type T and a raw pointer
+/// to the next entry in the node.  Since `atomic_try_update` speculatively
+/// executes code, it can not handle values of `Box<T>` soundly.  Therefore,
+/// this is the idiomatic way to store linked lists and stacks with
+/// `atomic_try_update`.
+///
+/// TODO: Work out safety for this API.
+#[derive(Debug)]
+pub struct Node<T> {
+    pub val: T,
+    pub next: *mut Node<T>,
+}
+
+unsafe impl<T> Send for NodeIterator<T> {}
+
+/// A consuming iterator over a value of type Node.
+///
+/// TODO: Document safety here, and (ideally) figure out how to
+/// allow people to write atomic_try_update lambdas from outside
+/// this package, but not write garbage to next from `safe` code.
+/// That way, this API won't need an `unsafe` annotation (which
+/// it is currently missing).
+pub struct NodeIterator<T> {
+    node: *mut Node<T>,
+}
+
+impl<T> Iterator for NodeIterator<T> {
+    type Item = T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.node.is_null() {
+            return None;
+        }
+        let popped: Box<Node<T>> = unsafe { Box::from_raw(self.node) };
+        self.node = popped.next;
+        Some(popped.val)
+    }
+}
+
+impl<T> NodeIterator<T> {
+    /// Takes ownership of node, in the style of Box::from_raw
+    ///
+    /// TODO: This could take a Box, and then we wouldn't need to add an unsafe annotation to it.
+    pub fn new(node: *mut Node<T>) -> Self {
+        Self { node }
+    }
+
+    pub fn rev(mut self) -> Self {
+        let mut ret = Self { node: null_mut() };
+        while !self.node.is_null() {
+            let popped = self.node;
+            unsafe {
+                self.node = (*popped).next;
+                (*popped).next = ret.node;
+                ret.node = popped;
+            }
+        }
+        ret
+    }
+}
+
+impl<T> Drop for NodeIterator<T> {
+    fn drop(&mut self) {
+        for _ in self {}
     }
 }

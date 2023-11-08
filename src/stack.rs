@@ -1,55 +1,33 @@
-use super::{atomic_try_update, Atom};
+//! # Lightweight lock-free stack implementations
+//! It is surprisingly difficult to correctly use and implement a lock-free
+//! stack that provides the standard push/pop interface.
+//!
+//! In particular, pop has to traverse a pointer to obtain the next node in
+//! the stack.  It is possible that the target of the pointer changes in
+//! race (due to multiple concurrent stack pops), or even that the old head
+//! was popped and deallocated and then a new entry with the same address
+//! was allocated and pushed back on as the head of the stack.  At this point
+//! a compare and swap of the old head with the new one would incorrectly
+//! succeed, leading to an instance of the "ABA problem."
+//!
+//! Naive stack algorithms suffer from the following ABA issue:  It is possible
+//! for pop() to read the head pointer "A", then be descheduled.  In race, the
+//! head pointer and some other values are popped, then a node with the same
+//! memory address as A is pushed back onto the stack.  The CAS will succeed,
+//! even though the current value of head is semantically distinct from the
+//! value the lambda read.
+//!
+//! `Stack` avoids this by providing a `pop_all` method that removes everything
+//! from the stack atomically.  This guarantees read set equivalence because it
+//! does not read anything other than the CAS bits.
+//!
+//! `NonceStack` uses a nonce to ensure that no pushes have been performed
+//! in race with pop, which probabilistically guarantees that head was not popped
+//! then pushed back on to the stack in race with a pop.
+
+//!
+use super::{atomic_try_update, Atom, Node, NodeIterator};
 use std::ptr::null_mut;
-
-#[derive(Debug)]
-pub struct Node<T> {
-    pub val: T,
-    pub next: *mut Node<T>,
-}
-
-unsafe impl<T> Send for NodeIterator<T> {}
-
-pub struct NodeIterator<T> {
-    node: *mut Node<T>,
-}
-
-impl<T> Iterator for NodeIterator<T> {
-    type Item = T;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.node.is_null() {
-            return None;
-        }
-        let popped: Box<Node<T>> = unsafe { Box::from_raw(self.node) };
-        self.node = popped.next;
-        Some(popped.val)
-    }
-}
-
-impl<T> NodeIterator<T> {
-    pub fn new(node: *mut Node<T>) -> Self {
-        Self { node }
-    }
-
-    pub fn rev(mut self) -> Self {
-        let mut ret = Self { node: null_mut() };
-        while !self.node.is_null() {
-            let popped = self.node;
-            unsafe {
-                self.node = (*popped).next;
-                (*popped).next = ret.node;
-                ret.node = popped;
-            }
-        }
-        ret
-    }
-}
-
-impl<T> Drop for NodeIterator<T> {
-    fn drop(&mut self) {
-        for _ in self {}
-    }
-}
 
 struct Head<T> {
     head: *mut Node<T>,
@@ -59,10 +37,6 @@ pub struct Stack<T>
 where
     T: Send,
 {
-    /* TODO: Need some type bounds on Atom<T>'s T to ensure this
-    is safe (e.g., it fits in a U = u128; can we prevent
-    people from putting a Box in here somehow?)
-    */
     head: Atom<Head<T>, u64>,
 }
 
@@ -70,9 +44,9 @@ impl<T> Default for Stack<T>
 where
     T: Send,
 {
-    fn default() -> Stack<T> {
-        Stack::<T> {
-            head: Atom::<Head<T>, u64>::new(),
+    fn default() -> Self {
+        Self {
+            head: Default::default(),
         }
     }
 }
@@ -82,8 +56,7 @@ where
     T: Send,
 {
     pub fn push(&self, val: T) {
-        #[allow(unused_mut)]
-        let mut node = Box::into_raw(Box::new(Node {
+        let node = Box::into_raw(Box::new(Node {
             val,
             next: std::ptr::null_mut(),
         }));
@@ -171,7 +144,7 @@ where
                 if ret.is_null() {
                     (false, ret)
                 } else {
-                    head.head = (*ret).next;
+                    head.head = (*ret).next; // Use after free here.  Could segfault.
                     (true, ret)
                 }
             })
