@@ -60,6 +60,7 @@ fn test_stack() {
 }
 
 #[test]
+#[ignore]
 fn test_nonce_stack() {
     use std::thread;
     let stack: NonceStack<u64> = Default::default();
@@ -131,8 +132,8 @@ async fn test_tokio_stack() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn test_node_iterator_reverse() {
+#[test]
+fn test_node_iterator_reverse() {
     let stack: Stack<u64> = Default::default();
 
     for i in 1..100 {

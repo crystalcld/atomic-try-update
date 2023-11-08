@@ -100,7 +100,9 @@ impl<T> Default for NonceStack<T>
 where
     T: Send,
 {
+    #[allow(unreachable_code)]
     fn default() -> NonceStack<T> {
+        todo!("This example code contains a use after free.");
         NonceStack::<T> {
             head: Default::default(),
         }
@@ -135,6 +137,38 @@ where
         }
     }
 
+    /// Almost-correct example of using a nonce to implement pop().
+    ///
+    /// This method contains a use-after-free on the line `head.head=(*ret).next`.
+    ///
+    /// This would be safe in a garbage collected system, or in an embedded
+    /// system without memory protection, since head.head will be discarded
+    /// if the stack has been changed, and *ret can only be freed after it is
+    /// popped from the stack.  Since *ret may have been freed, it may have
+    /// been returned to the operating system, leading to a segmentation fault
+    /// when accessed here.
+    ///
+    /// If you need a stack similar to NonceStack, consider using an epoch
+    /// collector such as crossbeam_epoch, or by maintaining a pool of
+    /// reusable objects.  For instance, you could use a second stack to
+    /// store the pool, and return objects to it after they are popped from
+    /// this stack.  If the pool stack is empty, then allocate a new object.
+    ///
+    /// Once you are sure that no thread will access either stack, you can
+    /// safely empty both stacks and free the objects they contain.
+    ///
+    /// Stacks with nonces are also sometimes used to implement slot allocators.
+    /// A slot allocator is initialized at startup with a finite number of
+    /// tokens (such as file handles, or some other finite resource).  When
+    /// a thread needs a resource, it pops from the stack.  If the stack is
+    /// empty, then the thread goes async.  Atomically checking that the stack
+    /// is empty and registering oneself for future wakeup is left as an exercise
+    /// to the reader, as it is exactly the sort of thing atomic_try_update excels
+    /// at.
+    ///
+    /// TODO: Implement a double-stack structure and/or slot such as the ones above,
+    /// so we have correct examples of the NonceStack pattern.
+
     #[allow(unused)]
     pub fn pop(&self) -> Option<T> {
         let node = unsafe {
@@ -144,7 +178,7 @@ where
                 if ret.is_null() {
                     (false, ret)
                 } else {
-                    head.head = (*ret).next; // Use after free here.  Could segfault.
+                    head.head = (*ret).next;
                     (true, ret)
                 }
             })

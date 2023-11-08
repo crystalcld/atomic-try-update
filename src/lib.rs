@@ -1,10 +1,11 @@
 //! Primitives that make it easy to implement correct lock-free algorithms
 //!
-//! `atomic_try_update` is the main entry-point to this library, but the
-//! included example code is also designed to be used in production.  Each
-//! module implements a different family of example algorithms.  If you
-//! simply want to use general-purpose algorithms without modification,
-//! start with the public APIs of the data structures in those modules.
+//! `atomic_try_update` is the main entry-point to this library, but (with
+//! the exception of `NonceStack`) the included example code is also designed
+//! to be used in production.  Each module implements a different family of
+//! example algorithms.  If you simply want to use general-purpose algorithms
+//! without modification, start with the public APIs of the data structures
+//! in those modules.
 //!
 //! If you want to start implementing your own specialized lock-free logic,
 //! start with this page, then read the top-level descriptions of each
@@ -165,22 +166,36 @@ unsafe impl<T, U> Send for Atom<T, U> {}
 /// with global state.  For instance, it could be a `Box` and talk to the
 /// allocator, or it could attempt to perform I/O.
 ///
-/// The lambda could read a value, store it on the heap or in a captured
-/// stack variable, and then return true.  If the compare and swap fails,
-/// the lambda runs again, and then fails to overwrite the state from
-/// the failed speculative read, then it violates linearizability.
+/// The lambda could speculatively read a value after it has been freed.
+/// Even if the lambda then discards the result without acting on it
+/// (which would be safe in a garbage collected language), the act of
+/// loading the freed value could read from memory that has been returned
+/// to the operating system, leading to a segmentation fault.  This is
+/// generally avoidable using an epoch based garbage collector, such as
+/// `crossbeam_epoch`, or by maintaining a pool of reused, but never
+/// freed objects for use by the data structure.
+///
+/// The lambda could speculatively read a value, store it on the heap
+/// or in a captured stack variable, and then return true.  If the
+/// compare and swap fails, the lambda runs again, and then fails to
+/// overwrite the state from the failed speculative read, then it
+/// violates linearizability.
 ///
 /// Thanks to the borrow checker, it is fairly difficult to implement
 /// such a bug.  In particular, if your lambda attempts to capture a
 /// shared reference (`&mut`), it will fail to compile.  However, you
 /// could defeat this check via internal mutability.
 ///
-/// Finally, your lambda could crash or exhibit undefined behavior.  Other
+/// Finally, the lambda could crash or exhibit undefined behavior.  Other
 /// versions of atomic_try_update include an "unsafe" (not in the rust
 /// sense) variant that allows torn reads.  This means that the bit
 /// representation of the object that is passed into your lambda could
 /// be invalid, violating Rust's safety guarantees, or causing sanity
-/// checks to fail, leading to panics.
+/// checks to fail, leading to panics.  Similarly, if the lambda follows
+/// a pointer to something that has been marked for reuse (and therefore,
+/// the compare and swap will fail), some other thread could modify that
+/// object in race with the current thread's failed speculative lambda
+/// invocation.
 pub unsafe fn atomic_try_update<T, U, F, R>(state: &Atom<T, U>, func: F) -> R
 where
     F: Fn(&mut T) -> (bool, R),
