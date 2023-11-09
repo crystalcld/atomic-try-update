@@ -1,5 +1,5 @@
-//! Examples of the claim mutual exclusion pattern, including a
-//! claim_queue, which allows multiple workers to enqueue work
+//! Examples of the claim mutual exclusion pattern, including an
+//! example of the claim_queue, which allows multiple workers to enqueue work
 //! and ensures that exactly one worker running if there is work
 //! to be done.
 //!
@@ -12,7 +12,7 @@
 use std::ptr::null_mut;
 
 use super::{atomic_try_update, bits::FlagU64, Atom, Node, NodeIterator};
-/// A special purpose trait for Count
+/// A special purpose trait for WriteOrderingQueue
 pub trait Countable {
     fn get_count(&self) -> u64;
 }

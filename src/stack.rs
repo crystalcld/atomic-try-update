@@ -91,7 +91,7 @@ where
     }
 }
 
-pub struct NonceHead<T> {
+struct NonceHead<T> {
     head: *mut Node<T>,
     nonce: u64,
 }
