@@ -14,9 +14,10 @@ keywords = ["lock-free", "stack", "linearizable", "scheduler", "mutual-exclusion
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+tokio = { version = "1.13", features = [ "sync" ] }
 crossbeam-utils = "0.8"
 num_enum = "0.6"
 
 [dev-dependencies]
 rand = "0.8"
-tokio = { version = "1", features = [ "macros", "rt-multi-thread", "test-util" ] }
+tokio = { version = "1.13", features = [ "macros", "rt-multi-thread", "test-util" ] }

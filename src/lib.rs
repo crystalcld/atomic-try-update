@@ -22,6 +22,7 @@ use std::{marker::PhantomData, ptr::null_mut};
 // https://docs.rs/portable-atomic/latest/portable_atomic/struct.AtomicU128.html
 use crossbeam_utils::atomic::AtomicCell;
 
+pub mod barrier;
 pub mod bits;
 pub mod claim;
 pub mod once;
