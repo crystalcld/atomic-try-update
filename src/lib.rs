@@ -24,6 +24,7 @@ use crossbeam_utils::atomic::AtomicCell;
 
 pub mod bits;
 pub mod claim;
+pub mod once;
 pub mod stack;
 
 /// A wrapper that allows an instance of type T to be treated as though it is
