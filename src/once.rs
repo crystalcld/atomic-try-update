@@ -34,7 +34,6 @@ pub enum OnceLockFreeError {
     AlreadySet,
     AttemptToReadWhenUnset,
     AttemptToSetConcurrently,
-    UseAfterFreeBug,
     UnpreparedForSet,
 }
 
