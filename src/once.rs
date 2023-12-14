@@ -19,12 +19,22 @@ enum Lifecycle {
     Dead,
 }
 
+/// Not exposed in external API.  We panic on the field `UseAfterFreeBug`, and map
+/// everything else to `OnceLockFreeError` before returning it to callers.
+enum OnceLockFreeInternalError {
+    AlreadySet,
+    AttemptToReadWhenUnset,
+    AttemptToSetConcurrently,
+    UseAfterFreeBug,
+    UnpreparedForSet,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum OnceLockFreeError {
     AlreadySet,
     AttemptToReadWhenUnset,
     AttemptToSetConcurrently,
-    InShutdown,
+    UseAfterFreeBug,
     UnpreparedForSet,
 }
 
@@ -33,6 +43,16 @@ impl Error for OnceLockFreeError {}
 impl Display for OnceLockFreeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{self:?}")
+    }
+}
+
+fn panic_on_memory_bug(err: OnceLockFreeInternalError) -> OnceLockFreeError {
+    match err {
+        OnceLockFreeInternalError::AlreadySet => OnceLockFreeError::AlreadySet,
+        OnceLockFreeInternalError::AttemptToReadWhenUnset => OnceLockFreeError::AttemptToReadWhenUnset,
+        OnceLockFreeInternalError::AttemptToSetConcurrently => OnceLockFreeError::AttemptToSetConcurrently,
+        OnceLockFreeInternalError::UseAfterFreeBug => { panic!("Encountered use-after-free in OnceLockFree"); },
+        OnceLockFreeInternalError::UnpreparedForSet => OnceLockFreeError::UnpreparedForSet,
     }
 }
 
@@ -79,18 +99,19 @@ impl<'a, T> OnceLockFree<T> {
                         s.flag_ptr.set_flag(Lifecycle::Setting.into());
                         (true, Ok(None))
                     }
-                    Ok(Lifecycle::Setting) => {
-                        (false, Err(OnceLockFreeError::AttemptToSetConcurrently))
-                    }
+                    Ok(Lifecycle::Setting) =>
+                        (false, Err(OnceLockFreeInternalError::AttemptToSetConcurrently)),
                     Ok(Lifecycle::Set) => {
                         let ptr = s.flag_ptr.get_ptr();
                         (false, Ok(if ptr.is_null() { None } else { Some(ptr) }))
                     }
-                    Ok(Lifecycle::Dead) => (false, Err(OnceLockFreeError::InShutdown)),
+                    Ok(Lifecycle::Dead) =>
+                        (false, Err(OnceLockFreeInternalError::UseAfterFreeBug)),
                     Err(_) => {
                         panic!("torn read?")
                     }
-                })?
+                })
+                .map_err(panic_on_memory_bug)?
                 .map(|ptr| &(*ptr).inner),
             )
         }
@@ -104,8 +125,8 @@ impl<'a, T> OnceLockFree<T> {
     pub fn get(&'a self) -> Result<&'a T, OnceLockFreeError> {
         match self.get_or_seal()? {
             Some(t) => Ok(t),
-            None => Err(OnceLockFreeError::AttemptToReadWhenUnset),
-        }
+            None => Err(OnceLockFreeInternalError::AttemptToReadWhenUnset),
+        }.map_err(panic_on_memory_bug)
     }
 
     /// Gets the reference to the underlying value, or None if the value has
@@ -137,17 +158,18 @@ impl<'a, T> OnceLockFree<T> {
                         (true, Ok(None))
                     }
                     Ok(Lifecycle::Setting) => {
-                        (false, Err(OnceLockFreeError::AttemptToSetConcurrently))
+                        (false, Err(OnceLockFreeInternalError::AttemptToSetConcurrently))
                     }
                     Ok(Lifecycle::Set) => {
                         let ptr = s.flag_ptr.get_ptr();
                         (false, Ok(if ptr.is_null() { None } else { Some(ptr) }))
                     }
-                    Ok(Lifecycle::Dead) => (false, Err(OnceLockFreeError::InShutdown)),
+                    Ok(Lifecycle::Dead) => (false, Err(OnceLockFreeInternalError::UseAfterFreeBug)),
                     Err(_) => {
                         panic!("torn read?")
                     }
-                })?
+                })
+                .map_err(panic_on_memory_bug)?
                 .map(|ptr| (&(*ptr).inner)),
             )
         }
@@ -166,18 +188,19 @@ impl<'a, T> OnceLockFree<T> {
         let ptr: *mut Align8<T> = Box::into_raw(Box::new(val.into()));
         unsafe {
             atomic_try_update(&self.inner, |s| match s.flag_ptr.get_flag().try_into() {
-                Ok(Lifecycle::NotSet) => (false, Err(OnceLockFreeError::UnpreparedForSet)),
+                Ok(Lifecycle::NotSet) => (false, Err(OnceLockFreeInternalError::UnpreparedForSet)),
                 Ok(Lifecycle::Setting) => {
                     s.flag_ptr.set_flag(Lifecycle::Set.into());
                     s.flag_ptr.set_ptr(ptr);
                     (true, Ok(()))
                 }
-                Ok(Lifecycle::Set) => (false, Err(OnceLockFreeError::AlreadySet)),
-                Ok(Lifecycle::Dead) => (false, Err(OnceLockFreeError::InShutdown)),
+                Ok(Lifecycle::Set) => (false, Err(OnceLockFreeInternalError::AlreadySet)),
+                Ok(Lifecycle::Dead) => (false, Err(OnceLockFreeInternalError::UseAfterFreeBug)),
                 Err(_) => {
                     panic!("torn read?")
                 }
-            })?;
+            })
+            .map_err(panic_on_memory_bug)?;
             Ok(&(*ptr).inner)
         }
     }
@@ -193,13 +216,14 @@ impl<'a, T> OnceLockFree<T> {
                     s.flag_ptr.set_ptr(ptr);
                     (true, Ok(()))
                 }
-                Ok(Lifecycle::Setting) => (false, Err(OnceLockFreeError::AttemptToSetConcurrently)),
-                Ok(Lifecycle::Set) => (false, Err(OnceLockFreeError::AlreadySet)),
-                Ok(Lifecycle::Dead) => (false, Err(OnceLockFreeError::InShutdown)),
+                Ok(Lifecycle::Setting) => (false, Err(OnceLockFreeInternalError::AttemptToSetConcurrently)),
+                Ok(Lifecycle::Set) => (false, Err(OnceLockFreeInternalError::AlreadySet)),
+                Ok(Lifecycle::Dead) => (false, Err(OnceLockFreeInternalError::UseAfterFreeBug)),
                 Err(_) => {
                     panic!("torn read?")
                 }
-            })?;
+            })
+            .map_err(panic_on_memory_bug)?;
             Ok(&(*ptr).inner)
         }
     }
@@ -220,26 +244,27 @@ impl<T> Drop for OnceLockFree<T> {
                 match s.flag_ptr.get_flag().try_into() {
                     Ok(Lifecycle::NotSet) => {
                         s.flag_ptr.set_flag(Lifecycle::Dead.into());
-                        (true, None)
+                        (true, Ok(None))
                     }
                     Ok(Lifecycle::Setting) => {
                         s.flag_ptr.set_flag(Lifecycle::Dead.into());
-                        (true, None)
+                        (true, Ok(None))
                     }
                     Ok(Lifecycle::Set) => {
                         s.flag_ptr.set_flag(Lifecycle::Dead.into());
                         let ptr = s.flag_ptr.get_ptr();
-                        (true, if ptr.is_null() { None } else { Some(ptr) })
+                        (true, if ptr.is_null() { Ok(None) } else { Ok(Some(ptr)) })
                     }
                     Ok(Lifecycle::Dead) => {
                         // TODO: report double free (as a panic outside the atomic_try_update)
-                        (false, None) // don't want to double free!
+                        (false, Err(OnceLockFreeInternalError::UseAfterFreeBug)) // don't want to double free!
                     }
                     Err(_) => {
-                        (true, None) // CAS from torn read should fail.
+                        (true, Ok(None)) // CAS from torn read should fail.
                     }
                 }
-            }) {
+            })
+            .map_err(panic_on_memory_bug).unwrap() {
                 None => (),
                 Some(ptr) => {
                     let _drop = Box::from_raw(ptr);
